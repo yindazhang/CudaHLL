@@ -17,13 +17,18 @@
 #define cublasCheck(err) (cublasErrorCheck(err, __FILE__, __LINE__))
 #define ROUND_UP_TO_NEAREST(M, N) (((M) + (N)-1) / (N))
 
-#define BLOCK_SIZE
+#define BLOCK_SIZE 1024
+#define MAX_MERGE 4096
+
+#define MULTI 4
 
 enum Algo
 {
     cpu = 0,
     basic,
-    opt,
+    multi,
+    merge,
+    multi_merge,
     numAlgos
 };
 
@@ -35,8 +40,12 @@ const char *algo2str(Algo a)
         return "cpu";
     case basic:
         return "basic";
-    case opt:
-        return "opt";
+    case multi:
+        return "multi";
+    case merge:
+        return "merge";
+    case multi_merge:
+        return "multi_merge";
     default:
         return "INVALID";
     }
@@ -103,7 +112,7 @@ int main(int argc, char **argv)
     const bool VALIDATE = clFlags["validate"].as<bool>();
     const uint SEED = clFlags["rngseed"].as<uint>();
     distribution.seed(SEED);
-    printf("Multiplying two %u x %u matrices with %u trials using %s algorithm\n", SIZE, SIZE, REPS, algo2str(ALGO));
+    printf("Using %s algorithm\n", algo2str(ALGO));
 
     cudaCheck(cudaSetDevice(0));
 
@@ -126,23 +135,20 @@ int main(int argc, char **argv)
 
     cudaCheck(cudaMalloc((void **)&dA, sizeof(uint32_t) * SIZE));
     cudaCheck(cudaMalloc((void **)&dC, sizeof(uint8_t) * HLLM));
-    cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(uint8_t) * HLLM));
 
     cudaCheck(cudaMemcpy(dA, A, sizeof(uint32_t) * SIZE, cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(dC, C, sizeof(uint8_t) * HLLM, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(dC_ref, C, sizeof(uint8_t) * HLLM, cudaMemcpyHostToDevice));
 
     printf("size: %u, m in HLL: %u\n", SIZE, HLLM);
 
     // Verify the correctness of the calculation, and execute it once before the
     // kernel function timing to avoid cold start errors
-    if (!VALIDATE)
+    if (!VALIDATE || ALGO == cpu)
     {
         printf("disabled validation\n");
     }
     else
     {
-        // run cublas to get correct answer in dC_ref
         runCpu(SIZE, HLLM, A, C_ref);
 
         // run user's algorithm, filling in dC
@@ -259,9 +265,25 @@ void runCpu(int N, int M, uint32_t *A, uint8_t *C){
     {
         uint32_t data = A[i];
         uint32_t position = cpuHash(data, 0) % M;
-        INT16_MIN value = countl_zero(cpuHash(data, 1)) + 1;
+        uint8_t value = __builtin_clz(cpuHash(data, 1)) + 1;
         C[position] = max(C[position], value);
     }
+}
+
+__device__ uint8_t atomicMax8(uint8_t* address, uint8_t val){
+    unsigned int *base_address = (unsigned int *)((size_t)address & ~3);
+    unsigned int selectors[] = {0x3214, 0x3240, 0x3410, 0x4210};
+    unsigned int sel = selectors[(size_t)address & 3];
+    unsigned int old, assumed, max_, new_;
+
+    old = *base_address;
+    do {
+        assumed = old;
+        max_ = max(val, (char)__byte_perm(old, 0, ((size_t)address & 3)));
+        new_ = __byte_perm(old, max_, sel);
+        old = atomicCAS(base_address, assumed, new_);
+    } while (assumed != old);
+    return old;
 }
 
 __global__ void runBasic(int N, int M, uint32_t *A, uint8_t *C){
@@ -271,22 +293,124 @@ __global__ void runBasic(int N, int M, uint32_t *A, uint8_t *C){
         uint32_t data = A[index];
         uint32_t position = cudaHash(data, 0) % M;
         int value = __clz(cudaHash(data, 1)) + 1;
-        atomicMax(&C[position], value);
+        atomicMax8(&C[position], value);
     }
 }
+
+__global__ void runMulti(int N, int M, uint32_t *A, uint8_t *C){
+    uint32_t start = (blockIdx.x * blockDim.x + threadIdx.x) * MULTI;
+
+    uint32_t position[MULTI];
+    uint8_t value[MULTI];
+
+    for(uint32_t i = 0;i < MULTI;++i){
+        uint32_t index = start + i;
+        if(index < N){
+            position[i] = cudaHash(A[index], 0) % M;
+            value[i] = __clz(cudaHash(A[index], 1)) + 1;
+        }
+    }
+
+    for(uint32_t i = 0;i < MULTI;++i){
+        uint32_t index = start + i;
+        if(index < N){
+            atomicMax8(&C[position[i]], value[i]);
+        }
+    }
+}
+
+__global__ void runMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
+    __shared__ uint8_t merge[MAX_MERGE];
+
+    const unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < N)
+    {
+        uint32_t data = A[index];
+        uint32_t position = cudaHash(data, 0) % M;
+        int value = __clz(cudaHash(data, 1)) + 1;
+        atomicMax8(&merge[position], value);
+    }
+
+    __syncthreads();
+
+    uint32_t start = threadIdx.x * gap;
+    uint32_t end = (threadIdx.x + 1) * gap;
+
+    for(uint32_t i = start;i < end;++i){
+        if(i < M){
+            atomicMax8(&C[i], merge[i]);
+        }
+    }
+}
+
+__global__ void runMultiMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
+    __shared__ uint8_t merge[MAX_MERGE];
+    
+    uint32_t start = (blockIdx.x * blockDim.x + threadIdx.x) * MULTI;
+
+    uint32_t position[MULTI];
+    uint8_t value[MULTI];
+
+    for(uint32_t i = 0;i < MULTI;++i){
+        uint32_t index = start + i;
+        if(index < N){
+            position[i] = cudaHash(A[index], 0) % M;
+            value[i] = __clz(cudaHash(A[index], 1)) + 1;
+        }
+    }
+
+    for(uint32_t i = 0;i < MULTI;++i){
+        uint32_t index = start + i;
+        if(index < N){
+            atomicMax8(&merge[position[i]], value[i]);
+        }
+    }
+
+    __syncthreads();
+
+    uint32_t begin = threadIdx.x * gap;
+    uint32_t end = (threadIdx.x + 1) * gap;
+
+    for(uint32_t i = begin;i < end;++i){
+        if(i < M){
+            atomicMax8(&C[i], merge[i]);
+        }
+    }
+}
+
 
 void runAlgo(Algo algo, int N, int M, uint32_t *A, uint8_t *C, uint32_t *dA, uint8_t *dC)
 {
     switch (algo)
     {
     case cpu:
+    {
         runCpu(N, M, A, C);
         break;
+    }
     case basic:
     {
-        dim3 gridDim(ROUND_UP_TO_NEAREST(SIZE, BLOCK_SIZE));
-        dim3 blockDim(BLOCK_SIZE);
-        runBasic<<<gridDim, blockDim>>>(N, M, dA, dC);
+        runBasic<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE>>>(N, M, dA, dC);
+        break;
+    }
+    case multi:
+    {
+        runMulti<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE * MULTI), BLOCK_SIZE>>>(N, M, dA, dC);
+        break;
+    }
+    case merge:
+    {
+        assert(M <= MAX_MERGE);
+        runMerge<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE>>>(N, M, 
+                    ROUND_UP_TO_NEAREST(M, BLOCK_SIZE), dA, dC);
+        break;
+    }
+    case multi_merge:
+    {
+        assert(M <= MAX_MERGE);
+        runMultiMerge<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE * MULTI), BLOCK_SIZE>>>(N, M, 
+                    ROUND_UP_TO_NEAREST(M, BLOCK_SIZE), dA, dC);
         break;
     }
     default:
