@@ -26,6 +26,7 @@ enum Algo
 {
     cpu = 0,
     basic,
+    filter,
     multi,
     merge,
     multi_merge,
@@ -40,6 +41,8 @@ const char *algo2str(Algo a)
         return "cpu";
     case basic:
         return "basic";
+    case filter:
+        return "filter";
     case multi:
         return "multi";
     case merge:
@@ -53,21 +56,21 @@ const char *algo2str(Algo a)
 
 void cudaErrorCheck(cudaError_t error, const char *file, int line);
 void cublasErrorCheck(cublasStatus_t status, const char *file, int line);
-void randomize_vector(uint32_t *mat, int N, double skewness);
 bool verify_hll(uint8_t *expected, uint8_t *actual, int M);
 void runAlgo(Algo algo, int N, int M, uint32_t *A, uint8_t *C, uint32_t *dA, uint8_t *dC);
 void runCpu(int N, int M, uint32_t *A, uint8_t *C);
 
-const std::string errLogFile = "hllValidationFailure.txt";
+//TODO: genreate duplicates based on skewness
+void randomize_vector(uint32_t *mat, int N, double skewness);
 
-// NB: must use a single generator to avoid duplicates
+const std::string errLogFile = "hllValidationFailure.txt";
 std::mt19937 distribution;
 
 int main(int argc, char **argv)
 {
     // command-line flags
     cxxopts::Options options("hll.cu", "CUDA HLL kernels");
-    options.add_options()("size", "dataset size (2^N)", cxxopts::value<uint8_t>()->default_value("20"))
+    options.add_options()("size", "dataset size (2^N)", cxxopts::value<uint8_t>()->default_value("26"))
         ("skew", "skewness of the dataset", cxxopts::value<double>()->default_value("0")) //TODO
         ("bconfig", "b in the configuration of HLL", cxxopts::value<uint8_t>()->default_value("10"))
         ("reps", "repeat HLL this many times", cxxopts::value<uint16_t>()->default_value("1"))
@@ -84,9 +87,9 @@ int main(int argc, char **argv)
     }
 
     uint32_t SIZE = clFlags["size"].as<uint8_t>();
-    if (SIZE > 25)
+    if (SIZE > 30)
     {
-        std::cout << "--size must be smaller than 25" << std::endl;
+        std::cout << "--size must be smaller than 30" << std::endl;
         exit(EXIT_FAILURE);
     }
     SIZE = (1 << SIZE);
@@ -179,7 +182,6 @@ int main(int argc, char **argv)
         cudaCheck(cudaDeviceSynchronize());
     }
 
-    // TODO: measure timing without memory transfers?
     cudaCheck(cudaEventRecord(end));
     cudaCheck(cudaEventSynchronize(beg));
     cudaCheck(cudaEventSynchronize(end));
@@ -189,7 +191,7 @@ int main(int argc, char **argv)
 
     double flops = SIZE;
     printf(
-        "Average elapsed time: (%7.6f) s, performance: (%7.2f) GFLOPS. size: (%u).\n",
+        "Average elapsed time: (%7.6f) s, performance: (%7.2f) GIPS. size: (%u).\n",
         elapsed_time / REPS,
         (REPS * flops * 1e-9) / elapsed_time,
         SIZE);
@@ -266,11 +268,14 @@ void runCpu(int N, int M, uint32_t *A, uint8_t *C){
         uint32_t data = A[i];
         uint32_t position = cpuHash(data, 0) % M;
         uint8_t value = __builtin_clz(cpuHash(data, 1)) + 1;
-        C[position] = max(C[position], value);
+        if(value > C[position])
+            C[position] = value;
     }
 }
 
-__device__ uint8_t atomicMax8(uint8_t* address, uint8_t val){
+// atomicMax in CUDA only supports uint32_t
+// We implement atomicMax for uint8_t based on atomicCAS
+__device__ void atomicMax8(uint8_t* address, uint8_t val){
     unsigned int *base_address = (unsigned int *)((size_t)address & ~3);
     unsigned int selectors[] = {0x3214, 0x3240, 0x3410, 0x4210};
     unsigned int sel = selectors[(size_t)address & 3];
@@ -282,8 +287,8 @@ __device__ uint8_t atomicMax8(uint8_t* address, uint8_t val){
         max_ = max(val, (char)__byte_perm(old, 0, ((size_t)address & 3)));
         new_ = __byte_perm(old, max_, sel);
         old = atomicCAS(base_address, assumed, new_);
-    } while (assumed != old);
-    return old;
+    } while (assumed != old && val > *address);
+    return;
 }
 
 __global__ void runBasic(int N, int M, uint32_t *A, uint8_t *C){
@@ -297,6 +302,19 @@ __global__ void runBasic(int N, int M, uint32_t *A, uint8_t *C){
     }
 }
 
+__global__ void runFilter(int N, int M, uint32_t *A, uint8_t *C){
+    const unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < N)
+    {
+        uint32_t data = A[index];
+        uint32_t position = cudaHash(data, 0) % M;
+        int value = __clz(cudaHash(data, 1)) + 1;
+        if(value > C[position]) // Add a simple filter
+            atomicMax8(&C[position], value);
+    }
+}
+
+// Process MULTI items in one thread
 __global__ void runMulti(int N, int M, uint32_t *A, uint8_t *C){
     uint32_t start = (blockIdx.x * blockDim.x + threadIdx.x) * MULTI;
 
@@ -313,12 +331,14 @@ __global__ void runMulti(int N, int M, uint32_t *A, uint8_t *C){
 
     for(uint32_t i = 0;i < MULTI;++i){
         uint32_t index = start + i;
-        if(index < N){
+        if(index < N && value[i] > C[position[i]]){
             atomicMax8(&C[position[i]], value[i]);
         }
     }
 }
 
+// Each block maintains a shared HyperLogLog
+// Then merge multiple HyperLogLogs
 __global__ void runMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
     __shared__ uint8_t merge[MAX_MERGE];
 
@@ -329,7 +349,8 @@ __global__ void runMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
         uint32_t data = A[index];
         uint32_t position = cudaHash(data, 0) % M;
         int value = __clz(cudaHash(data, 1)) + 1;
-        atomicMax8(&merge[position], value);
+        if(value > merge[position])
+            atomicMax8(&merge[position], value);
     }
 
     __syncthreads();
@@ -338,12 +359,14 @@ __global__ void runMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
     uint32_t end = (threadIdx.x + 1) * gap;
 
     for(uint32_t i = start;i < end;++i){
-        if(i < M){
+        if(i < M && merge[i] > C[i]){
             atomicMax8(&C[i], merge[i]);
         }
     }
 }
 
+
+// Merge + Process MULTI items in one thread
 __global__ void runMultiMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
     __shared__ uint8_t merge[MAX_MERGE];
     
@@ -363,7 +386,8 @@ __global__ void runMultiMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
     for(uint32_t i = 0;i < MULTI;++i){
         uint32_t index = start + i;
         if(index < N){
-            atomicMax8(&merge[position[i]], value[i]);
+            if(value[i] > merge[position[i]])
+                atomicMax8(&merge[position[i]], value[i]);
         }
     }
 
@@ -373,7 +397,7 @@ __global__ void runMultiMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
     uint32_t end = (threadIdx.x + 1) * gap;
 
     for(uint32_t i = begin;i < end;++i){
-        if(i < M){
+        if(i < M && merge[i] > C[i]){
             atomicMax8(&C[i], merge[i]);
         }
     }
@@ -394,6 +418,11 @@ void runAlgo(Algo algo, int N, int M, uint32_t *A, uint8_t *C, uint32_t *dA, uin
         runBasic<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE>>>(N, M, dA, dC);
         break;
     }
+    case filter:
+    {
+        runFilter<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE>>>(N, M, dA, dC);
+        break;
+    }
     case multi:
     {
         runMulti<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE * MULTI), BLOCK_SIZE>>>(N, M, dA, dC);
@@ -401,6 +430,8 @@ void runAlgo(Algo algo, int N, int M, uint32_t *A, uint8_t *C, uint32_t *dA, uin
     }
     case merge:
     {
+        // As the shared memory is limited
+        // M must be smaller than the size of shared memory
         assert(M <= MAX_MERGE);
         runMerge<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE>>>(N, M, 
                     ROUND_UP_TO_NEAREST(M, BLOCK_SIZE), dA, dC);
