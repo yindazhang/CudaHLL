@@ -5,13 +5,17 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
-
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <iostream>
+#include <memory>
+#include <vector>
+#include "cxxopts.hpp"
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <curand.h>
+#include <curand_kernel.h>
 
 // from https://github.com/jarro2783/cxxopts
-#include "cxxopts.hpp"
 
 #define cudaCheck(err) (cudaErrorCheck(err, __FILE__, __LINE__))
 #define cublasCheck(err) (cublasErrorCheck(err, __FILE__, __LINE__))
@@ -21,6 +25,47 @@
 #define MAX_MERGE 4096
 
 #define MULTI 4
+
+class DeviceMemory {
+public:
+    DeviceMemory(size_t size) {
+        cudaMalloc(&ptr, size);
+    }
+
+    ~DeviceMemory() {
+        cudaFree(ptr);
+    }
+
+    void* get() const {
+        return ptr;
+    }
+
+private:
+    void* ptr = nullptr;
+};
+
+template <typename T>
+class HostMemory {
+public:
+    HostMemory(size_t size) : size(size), data(new T[size]) {}
+
+    ~HostMemory() {
+        delete[] data;
+    }
+
+    T* get() const {
+        return data;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+private:
+    T* data;
+    size_t size;
+};
+
 
 enum Algo
 {
@@ -47,7 +92,7 @@ const char *algo2str(Algo a)
         return "multi";
     case merge:
         return "merge";
-    case multi_merge:
+    case multi_merge: 
         return "multi_merge";
     default:
         return "INVALID";
@@ -57,7 +102,7 @@ const char *algo2str(Algo a)
 void cudaErrorCheck(cudaError_t error, const char *file, int line);
 void cublasErrorCheck(cublasStatus_t status, const char *file, int line);
 bool verify_hll(uint8_t *expected, uint8_t *actual, int M);
-void runAlgo(Algo algo, int N, int M, uint32_t *A, uint8_t *C, uint32_t *dA, uint8_t *dC);
+void runAlgo(Algo algo, int N, int M, uint32_t *A, uint8_t *C, uint32_t *dA, uint8_t *dC, cudaStream_t stream);
 void runCpu(int N, int M, uint32_t *A, uint8_t *C);
 
 //TODO: genreate duplicates based on skewness
@@ -86,13 +131,13 @@ int main(int argc, char **argv)
         exit(0);
     }
 
-    uint32_t SIZE = clFlags["size"].as<uint8_t>();
-    if (SIZE > 30)
-    {
-        std::cout << "--size must be smaller than 30" << std::endl;
-        exit(EXIT_FAILURE);
+    uint8_t inputSize = clFlags["size"].as<uint8_t>();
+    if (inputSize >= 30) {
+    std::cerr << "Error: --size must be smaller than 30" << std::endl;
+    exit(EXIT_FAILURE);
     }
-    SIZE = (1 << SIZE);
+    uint32_t SIZE = (1 << inputSize);
+
     double skewness = clFlags["skew"].as<double>();
 
     uint8_t HLLB = clFlags["bconfig"].as<uint8_t>();
@@ -101,7 +146,8 @@ int main(int argc, char **argv)
         std::cout << "--b in HLL must be in the range [4,25]" << std::endl;
         exit(EXIT_FAILURE);
     }
-    uint32_t HLLM = (1 << HLLB);
+
+    uint32_t HLLM = (1 << clFlags["bconfig"].as<uint8_t>());
 
 
     const uint16_t REPS = clFlags["reps"].as<uint16_t>();
@@ -125,23 +171,26 @@ int main(int argc, char **argv)
     cudaCheck(cudaEventCreate(&beg));
     cudaCheck(cudaEventCreate(&end));
 
-    uint32_t *A = nullptr, *dA = nullptr;
-    uint8_t *C = nullptr, *C_ref = nullptr, *dC = nullptr;
+    uint32_t* h_A;
+    cudaMallocHost(&h_A, sizeof(uint32_t) * SIZE);
+    randomize_vector(h_A, SIZE, skewness);
 
-    A = (uint32_t *)malloc(sizeof(uint32_t) * SIZE);
-    C = (uint8_t *)malloc(sizeof(uint8_t) * HLLM);
-    C_ref = (uint8_t *)malloc(sizeof(uint8_t) * HLLM);
+    uint8_t* h_C;
+    cudaMallocHost(&h_C, sizeof(uint8_t) * HLLM);
+    memset(h_C, 0, sizeof(uint8_t) * HLLM);
 
-    randomize_vector(A, SIZE, skewness);
-    memset(C, 0, sizeof(uint8_t) * HLLM);
-    memset(C_ref, 0, sizeof(uint8_t) * HLLM);
+    uint8_t* h_C_ref;
+    cudaMallocHost(&h_C_ref, sizeof(uint8_t) * HLLM);
+    memset(h_C_ref, 0, sizeof(uint8_t) * HLLM);
 
-    cudaCheck(cudaMalloc((void **)&dA, sizeof(uint32_t) * SIZE));
-    cudaCheck(cudaMalloc((void **)&dC, sizeof(uint8_t) * HLLM));
+    DeviceMemory dA(sizeof(uint32_t) * SIZE);
+    DeviceMemory dC(sizeof(uint8_t) * HLLM);
 
-    cudaCheck(cudaMemcpy(dA, A, sizeof(uint32_t) * SIZE, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(dC, C, sizeof(uint8_t) * HLLM, cudaMemcpyHostToDevice));
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
 
+    cudaMemcpyAsync(dA.get(), h_A, sizeof(uint32_t) * SIZE, cudaMemcpyHostToDevice, stream);
+    
     printf("size: %u, m in HLL: %u\n", SIZE, HLLM);
 
     // Verify the correctness of the calculation, and execute it once before the
@@ -152,17 +201,19 @@ int main(int argc, char **argv)
     }
     else
     {
-        runCpu(SIZE, HLLM, A, C_ref);
+        runCpu(SIZE, HLLM, h_A, h_C_ref);
+
 
         // run user's algorithm, filling in dC
-        runAlgo(ALGO, SIZE, HLLM, A, C, dA, dC);
+        runAlgo(ALGO, SIZE, HLLM, h_A, h_C, static_cast<uint32_t*>(dA.get()), static_cast<uint8_t*>(dC.get()), stream);
 
-        cudaCheck(cudaDeviceSynchronize());
+        cudaMemcpyAsync(h_C, dC.get(), sizeof(uint8_t) * HLLM, cudaMemcpyDeviceToHost, stream);
 
         // copy both results back to host
-        cudaMemcpy(C, dC, sizeof(uint8_t) * HLLM, cudaMemcpyDeviceToHost);
+        cudaStreamSynchronize(stream);
 
-        if (verify_hll(C_ref, C, HLLM))
+
+        if (verify_hll(h_C_ref, h_C, HLLM))
         {
             printf("Validated successfully!\n");
         }
@@ -175,10 +226,8 @@ int main(int argc, char **argv)
 
     // timing run(s)
     cudaEventRecord(beg);
-    for (int j = 0; j < REPS; j++)
-    {
-        // We don't reset dC between runs to save time
-        runAlgo(ALGO, SIZE, HLLM, A, C, dA, dC);
+    for (int j = 0; j < REPS; j++) {
+        runAlgo(ALGO, SIZE, HLLM, h_A, h_C, static_cast<uint32_t*>(dA.get()), static_cast<uint8_t*>(dC.get()), stream);
         cudaCheck(cudaDeviceSynchronize());
     }
 
@@ -197,12 +246,10 @@ int main(int argc, char **argv)
         SIZE);
 
     // free CPU and GPU memory
-    free(A);
-    free(C);
-    free(C_ref);
-    cudaCheck(cudaFree(dA));
-    cudaCheck(cudaFree(dC));
-
+    cudaFreeHost(h_A);
+    cudaFreeHost(h_C);
+    cudaFreeHost(h_C_ref);
+    cudaStreamDestroy(stream);
     return 0;
 }
 
@@ -404,50 +451,32 @@ __global__ void runMultiMerge(int N, int M, int gap, uint32_t *A, uint8_t *C){
 }
 
 
-void runAlgo(Algo algo, int N, int M, uint32_t *A, uint8_t *C, uint32_t *dA, uint8_t *dC)
-{
-    switch (algo)
-    {
+void runAlgo(Algo algo, int N, int M, uint32_t *A, uint8_t *C, uint32_t *dA, uint8_t *dC, cudaStream_t stream) {
+    switch (algo) {
     case cpu:
-    {
         runCpu(N, M, A, C);
         break;
-    }
     case basic:
-    {
-        runBasic<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE>>>(N, M, dA, dC);
+        runBasic<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(N, M, dA, dC);
         break;
-    }
     case filter:
-    {
-        runFilter<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE>>>(N, M, dA, dC);
+        runFilter<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(N, M, dA, dC);
         break;
-    }
     case multi:
-    {
-        runMulti<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE * MULTI), BLOCK_SIZE>>>(N, M, dA, dC);
+        runMulti<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE * MULTI), BLOCK_SIZE, 0, stream>>>(N, M, dA, dC);
         break;
-    }
     case merge:
-    {
-        // As the shared memory is limited
-        // M must be smaller than the size of shared memory
         assert(M <= MAX_MERGE);
-        runMerge<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE>>>(N, M, 
-                    ROUND_UP_TO_NEAREST(M, BLOCK_SIZE), dA, dC);
+        runMerge<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(N, M, ROUND_UP_TO_NEAREST(M, BLOCK_SIZE), dA, dC);
         break;
-    }
     case multi_merge:
-    {
         assert(M <= MAX_MERGE);
-        runMultiMerge<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE * MULTI), BLOCK_SIZE>>>(N, M, 
-                    ROUND_UP_TO_NEAREST(M, BLOCK_SIZE), dA, dC);
+        runMultiMerge<<<ROUND_UP_TO_NEAREST(N, BLOCK_SIZE * MULTI), BLOCK_SIZE, 0, stream>>>(N, M, ROUND_UP_TO_NEAREST(M, BLOCK_SIZE), dA, dC);
         break;
-    }
     default:
         printf("Invalid algorithm: %d\n", algo);
         exit(EXIT_FAILURE);
     }
-    cudaCheck(cudaDeviceSynchronize()); // wait for kernel to finish
-    cudaCheck(cudaGetLastError());      // check for errors from kernel run
+    // Removed cudaDeviceSynchronize, replaced with cudaStreamSynchronize in main
+    cudaCheck(cudaGetLastError()); // Check for errors from kernel run
 }
