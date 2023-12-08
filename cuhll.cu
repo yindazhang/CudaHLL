@@ -66,6 +66,10 @@ private:
     size_t size;
 };
 
+enum HLLVersion {
+    ORIGINAL,
+    MODIFIED
+};
 
 enum Algo
 {
