@@ -22,7 +22,7 @@
 #define ROUND_UP_TO_NEAREST(M, N) (((M) + (N)-1) / (N))
 
 #define BLOCK_SIZE 1024
-#define MAX_MERGE 4096
+#define MAX_MERGE 40960
 
 #define MULTI 4
 
@@ -227,6 +227,9 @@ int main(int argc, char **argv)
             exit(EXIT_FAILURE);
         }
     }
+    // warm up run
+    runAlgo(ALGO, SIZE, HLLM, h_A, h_C, static_cast<uint32_t*>(dA.get()), static_cast<uint8_t*>(dC.get()), stream);
+    cudaCheck(cudaDeviceSynchronize());
 
     // timing run(s)
     cudaEventRecord(beg);
